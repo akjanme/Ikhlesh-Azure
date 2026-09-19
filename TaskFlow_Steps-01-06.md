@@ -1,49 +1,117 @@
-# TaskFlow Learning Journey — Steps 1 through 6
+# Steps 1 to 6 — From your laptop to Azure Container Registry
 
-**Stack:** Angular (frontend) + Node.js/Express (backend) → Azure App Service → Docker → Azure Container Registry → (next: AKS)
-**Rule for the whole journey:** the application never changes in a way that matters — only *how Azure hosts it* changes. When something breaks, that discipline lets you say "the app is fine, the hosting is wrong" instead of debugging both at once.
+**What you will cover in this file:**
+
+| Step | Topic |
+|------|-------|
+| 1 | Build the Angular + Node.js app on your laptop |
+| 2 | Deploy it to two Azure App Services |
+| 3 | Add a deployment slot and stop/start it |
+| 4 | Serve the app from a custom path `/myapp` |
+| 5 | Put the app inside Docker containers |
+| 6 | Upload the containers to Azure Container Registry |
 
 ---
+---
 
-## STEP 1 — Create the Angular + Node.js application
+# STEP 1 — Build the application
 
-### Objective
-Build a Node.js/Express API (`/api/hello`, `/api/health`) and an Angular frontend that calls it, entirely on your laptop, zero Azure resources involved.
+## 1.1 What you are doing
 
-### Architecture
+You are building a small app on your own computer. No Azure yet.
+
+Why no Azure yet? Because you want to be completely sure the app works before you add Azure to the picture. If you do both at once and something breaks, you will not know which one is broken.
+
+## 1.2 How the app works
+
+```mermaid
+flowchart TB
+    B["Your browser<br/>localhost:4200"]
+    NG["Angular dev server<br/>port 4200<br/>shows the web page"]
+    API["Node.js API<br/>port 3000<br/>returns JSON data"]
+
+    B -->|"you open the page"| NG
+    NG -->|"forwards anything starting with /api"| API
+    API -->|"JSON response"| NG
 ```
-┌─────────────┐        HTTP GET /api/hello        ┌───────────────────────┐
-│   Browser    │ ──────────────────────────────────▶│  Angular dev server   │
-│ localhost    │                                     │   ng serve :4200      │
-└─────────────┘                                     └───────────┬───────────┘
-                                                                  │ proxies /api/*
-                                                                  ▼
-                                                        ┌───────────────────────┐
-                                                        │ Node.js / Express API  │
-                                                        │         :3000          │
-                                                        └───────────────────────┘
+
+Two separate programs are running:
+
+- The **Angular dev server** on port 4200 shows the web page.
+- The **Node.js API** on port 3000 returns the data.
+
+## 1.3 Why we need a proxy
+
+Here is a problem you will hit.
+
+Your web page runs on **port 4200**. Your API runs on **port 3000**. Web browsers have a security rule: a page loaded from one address is not allowed to call a different address. Port 4200 and port 3000 count as different addresses.
+
+So if the page tries to call `http://localhost:3000/api/hello` directly, the browser blocks it. You see a **CORS error** in the browser console.
+
+The fix is a **proxy**. You tell the Angular dev server: "if the page asks for anything starting with `/api`, quietly forward that request to port 3000."
+
+Now the browser thinks it is only ever talking to port 4200. No security rule is broken.
+
+```mermaid
+flowchart TB
+    subgraph WITHOUT["Without a proxy"]
+        B1["Browser"] -->|"calls port 3000 directly"| X1["Browser blocks it<br/>CORS error"]
+    end
+
+    subgraph WITH["With a proxy"]
+        B2["Browser"] -->|"calls /api on port 4200"| NG2["Angular dev server"]
+        NG2 -->|"forwards to port 3000"| API2["Node API"]
+        API2 -->|"data comes back"| NG2
+    end
 ```
 
-**Why the proxy exists:** `localhost:4200` and `localhost:3000` are different origins even though both say "localhost" — a direct browser call triggers CORS unless the API explicitly allows it. The Angular proxy makes `/api/*` look same-origin during development. This "one hostname, many backends by path" idea reappears in Step 4 and again in AKS Ingress later.
+**Remember this idea.** You will see it again in Step 4, and again when you reach Kubernetes. "Send requests to different places based on the URL path" is a pattern you will use three times.
 
-### Folder layout
+## 1.4 Create the folders
+
+```bash
+mkdir taskflow-app
+cd taskflow-app
+mkdir backend
+```
+
+Your folder will end up looking like this:
+
 ```
 taskflow-app/
-├── backend/     Node.js / Express API
-└── frontend/    Angular application
+├── backend/     <- the Node.js API
+└── frontend/    <- the Angular web page, created in 1.9
 ```
 
-### Backend
+## 1.5 Build the backend
 
-`backend/server.js`:
+Go into the backend folder and set up a Node project:
+
+```bash
+cd backend
+npm init -y
+npm install express cors
+```
+
+What these commands do:
+
+- `npm init -y` creates a `package.json` file. This file lists your project's name, version and dependencies.
+- `npm install express cors` downloads two libraries. **Express** is the web server. **cors** is a helper that controls the browser security rule described above.
+
+Now create a file called `server.js` inside `backend`:
+
 ```js
 const express = require('express');
 const cors = require('cors');
+
 const app = express();
 app.use(cors());
 
+// The version comes from an environment variable.
+// If no environment variable is set, we fall back to '1.0.0'.
 const APP_VERSION = process.env.APP_VERSION || '1.0.0';
 
+// Endpoint 1: a simple greeting
 app.get('/api/hello', (req, res) => {
   res.json({
     message: 'Hello from Node.js API',
@@ -52,34 +120,106 @@ app.get('/api/hello', (req, res) => {
   });
 });
 
+// Endpoint 2: a health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'Healthy', version: APP_VERSION });
+  res.json({
+    status: 'Healthy',
+    version: APP_VERSION
+  });
 });
 
+// Azure and Docker will tell us which port to use.
+// If nobody tells us, use 3000.
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+
+app.listen(PORT, () => {
+  console.log('API running on port ' + PORT);
+});
 ```
 
-`backend/package.json` — the `start` script matters again in Step 2 (App Service runs this exact script):
+## 1.6 Two lines in that file are very important
+
+**Line 1: the version**
+
+```js
+const APP_VERSION = process.env.APP_VERSION || '1.0.0';
+```
+
+This reads the version from an **environment variable**. An environment variable is a setting you pass to a program from outside, without editing its code.
+
+Why does this matter? Because in every later step you will change the version **without touching this file**:
+
+| Step | How you set the version |
+|------|------------------------|
+| Step 2 | Azure App Service "Application Settings" |
+| Step 5 | Docker `-e APP_VERSION=2.0.0` |
+| Step 7 | Kubernetes `env:` section in a YAML file |
+
+Three different platforms, one identical idea. You are writing this line now so those three steps are easy later.
+
+**Line 2: the port**
+
+```js
+const PORT = process.env.PORT || 3000;
+```
+
+On your laptop, the app uses port 3000. But Azure App Service decides its own port and tells your app what it is. If you hardcode 3000, Azure will send traffic to a port your app is not listening on, and you will get a **502 error**.
+
+This single line prevents one of the most common Azure beginner problems.
+
+## 1.7 Add the start script
+
+Open `backend/package.json`. Find the `"scripts"` section and make it look like this:
+
 ```json
 {
   "name": "taskflow-api",
   "version": "1.0.0",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "express": "^4.19.0", "cors": "^2.8.5" }
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "cors": "^2.8.5"
+  }
 }
 ```
 
+The `"start"` line matters in Step 2. When you deploy to Azure, Azure does not know your file is called `server.js`. Azure just runs `npm start`. That command looks up this `"start"` line to find out what to run.
+
+If this line is missing, Azure deploys successfully but your app never starts.
+
+## 1.8 Test the backend
+
 ```bash
-cd backend
-npm init -y
-npm install express cors
 node server.js
 ```
 
-**Why `APP_VERSION` is env-driven from day one:** this single line is why Step 2's App Service settings and later Kubernetes ConfigMaps just work without touching this file again.
+You should see:
 
-### Frontend
+```
+API running on port 3000
+```
+
+Open a **second terminal**, leaving the first one running, and test it:
+
+```bash
+curl http://localhost:3000/api/hello
+```
+
+Expected result:
+
+```json
+{
+  "message": "Hello from Node.js API",
+  "version": "1.0.0",
+  "timestamp": "2026-09-19T10:32:01.452Z"
+}
+```
+
+## 1.9 Build the frontend
+
+Go back to the main folder and create the Angular app:
 
 ```bash
 cd ..
@@ -87,12 +227,23 @@ ng new frontend --routing=false --style=css
 cd frontend
 ```
 
-`frontend/proxy.conf.json`:
+This takes a minute or two. Angular downloads a lot of files.
+
+Now create a file called `proxy.conf.json` inside the `frontend` folder:
+
 ```json
-{ "/api": { "target": "http://localhost:3000", "secure": false } }
+{
+  "/api": {
+    "target": "http://localhost:3000",
+    "secure": false
+  }
+}
 ```
 
-`frontend/src/app/app.component.ts`:
+This is the proxy from section 1.3. It says: "any request starting with `/api`, send it to port 3000 instead."
+
+Now open `frontend/src/app/app.component.ts` and replace everything in it with:
+
 ```ts
 import { Component, OnInit } from '@angular/core';
 import { HttpClient, HttpClientModule } from '@angular/common/http';
@@ -101,295 +252,750 @@ import { HttpClient, HttpClientModule } from '@angular/common/http';
   selector: 'app-root',
   standalone: true,
   imports: [HttpClientModule],
-  template: `<h1>{{ message }}</h1><p>version: {{ version }}</p>`
+  template: `
+    <h1>{{ message }}</h1>
+    <p>version: {{ version }}</p>
+  `
 })
 export class AppComponent implements OnInit {
   message = 'Loading...';
   version = '';
+
   constructor(private http: HttpClient) {}
+
   ngOnInit() {
-    this.http.get<any>('/api/hello').subscribe(res => {
-      this.message = res.message;
-      this.version = res.version;
+    this.http.get<any>('/api/hello').subscribe(response => {
+      this.message = response.message;
+      this.version = response.version;
     });
   }
 }
 ```
 
+What this does: when the page loads, it calls `/api/hello`, waits for the answer, and puts the message and version onto the page.
+
+Notice it calls `/api/hello`, not `http://localhost:3000/api/hello`. That is deliberate. The proxy handles the rest.
+
+## 1.10 Run everything together
+
+You need **two terminals** open at the same time.
+
+Terminal 1, the backend:
 ```bash
+cd backend
+node server.js
+```
+
+Terminal 2, the frontend:
+```bash
+cd frontend
 ng serve --proxy-config proxy.conf.json
 ```
 
-### Expected result
-`http://localhost:4200` shows **"Hello from Node.js API"** and **"version: 1.0.0"**.
+Now open `http://localhost:4200` in your browser.
 
-### Verification checklist
-- [ ] `curl http://localhost:3000/api/health` returns `{"status":"Healthy",...}`
-- [ ] `ng serve --proxy-config proxy.conf.json` starts with no errors
-- [ ] Browser shows live message/version, not "Loading..." forever
-- [ ] Setting `APP_VERSION` before `node server.js` changes the displayed version with zero code changes
+## 1.11 Expected result
 
-### Common errors
-| Symptom | Cause | Fix |
-|---|---|---|
-| Stuck on "Loading..." | Missed `--proxy-config`, or backend not running | Confirm backend on `:3000`; restart with proxy flag |
-| CORS error | Missing `cors()`, or calling the absolute URL directly | Keep `app.use(cors())`; call `/api/hello`, not the absolute URL |
-| `ng: command not found` | Angular CLI not global | `npm install -g @angular/cli` |
-| Port 3000 in use | Leftover process | Kill it, or change `PORT` |
+The page shows:
+
+```
+Hello from Node.js API
+
+version: 1.0.0
+```
+
+If it says "Loading..." forever, the frontend could not reach the backend. See the troubleshooting table below.
+
+## 1.12 Prove the environment variable works
+
+Stop the backend with Ctrl+C in Terminal 1. Then start it again with a different version:
+
+```bash
+# Windows PowerShell
+$env:APP_VERSION = "9.9.9"
+node server.js
+
+# Mac or Linux
+APP_VERSION=9.9.9 node server.js
+```
+
+Refresh your browser. The page now shows `version: 9.9.9`.
+
+You changed what the app displays **without editing a single file**. This is the whole point of section 1.6. Remember this moment, because Steps 2, 5 and 7 all repeat it.
+
+## 1.13 Verification
+
+Tick every box before moving on.
+
+- [ ] `node server.js` starts and prints "API running on port 3000"
+- [ ] `curl http://localhost:3000/api/hello` returns JSON
+- [ ] `curl http://localhost:3000/api/health` returns `"status": "Healthy"`
+- [ ] The browser at `localhost:4200` shows the message and version
+- [ ] Setting `APP_VERSION` changes the displayed version without editing code
+- [ ] `backend/package.json` has a `"start": "node server.js"` line
+
+## 1.14 Troubleshooting
+
+| What you see | Why it happens | How to fix it |
+|-------------|---------------|--------------|
+| Page says "Loading..." forever | You started Angular without the proxy flag, or the backend is not running | Check the backend terminal is still running. Restart Angular with `--proxy-config proxy.conf.json` |
+| Red CORS error in browser console | The page is calling port 3000 directly | Make sure your code calls `/api/hello`, not `http://localhost:3000/api/hello` |
+| `ng: command not found` | Angular CLI is not installed | Run `npm install -g @angular/cli` |
+| `Error: listen EADDRINUSE :::3000` | Another program is already using port 3000 | Close the other program, or set a different port: `PORT=3001 node server.js` |
+| `Cannot find module 'express'` | You forgot to install the libraries | Run `npm install express cors` inside the `backend` folder |
 
 ---
+---
 
-## STEP 2 — Deploy to two Azure App Services
+# STEP 2 — Deploy to two Azure App Services
 
-### Objective
-Host the Step 1 app on Azure using **two separate App Service instances** — proving the same codebase runs independently in two places.
+## 2.1 What you are doing
 
-### Architecture
+You will put the same backend on Azure, twice, in two separate places. Each one gets its own public web address.
+
+Why twice? Two reasons:
+
+1. To see that two apps can run independently, even though they came from the same code.
+2. So that in Step 3 and Step 4 you can change one of them without affecting the other.
+
+## 2.2 Three new Azure words
+
+Before you create anything, learn these three words. Beginners mix them up constantly.
+
+**Resource Group**
+A folder for your Azure things. It holds no power and does no work. It just groups things so you can find them and delete them together.
+
+**App Service Plan**
+The actual computer. This is what you pay for. It has a size, meaning how much CPU and memory, and an operating system, Linux or Windows.
+
+**App Service**
+Your application running on that computer.
+
+```mermaid
+flowchart TB
+    subgraph RG["Resource group: rg-taskflow<br/>(just a folder, costs nothing)"]
+        subgraph PLAN["App Service Plan: asp-taskflow<br/>(the computer, you pay for this)"]
+            A1["App Service<br/>app-taskflow-api-01<br/>your app"]
+            A2["App Service<br/>app-taskflow-api-02<br/>your app"]
+        end
+    end
 ```
-┌───────────────┐     ┌──────────────────────────────┐
-│ Resource Group │     │   App Service Plan             │
-│ rg-taskflow    │────▶│   asp-taskflow (Linux, B1)     │
-└───────────────┘     └───────────────┬────────────────┘
-                                        │
-                       ┌────────────────┴────────────────┐
-                       ▼                                   ▼
-           ┌─────────────────────┐             ┌─────────────────────┐
-           │ app-taskflow-api-01  │             │ app-taskflow-api-02  │
-           │ Node.js API          │             │ Node.js API          │
-           └─────────────────────┘             └─────────────────────┘
-```
 
-**Why the Plan is separate from the App Service:** the Plan is the billed compute (VM size, OS, tier); the App Service is a logical app slot running on it. Two App Services on one Plan share the same VM(s) — cheaper while learning, and the classic interview question.
+The key thing to understand: **both App Services share one computer.** You pay for one Plan, not two. This is cheaper for learning. But it also means if one app gets very busy, the other one slows down too, because they share the same CPU and memory.
 
-### Portal steps
-1. **Create a resource** → **Resource Group** → `rg-taskflow`.
-2. Inside it → **Create** → **Web App**: name `app-taskflow-api-01`, Runtime **Node 20 LTS**, OS **Linux**, Plan: create new `asp-taskflow`, SKU **B1**.
-3. Repeat for `app-taskflow-api-02`, using the **existing** `asp-taskflow` Plan.
+In real production, important apps usually get their own Plan so they cannot slow each other down.
 
-### CLI
+## 2.3 Set your variables
+
+Run these once. Every later command reuses them.
+
 ```bash
 RG=rg-taskflow
 LOCATION=eastus
 PLAN=asp-taskflow
-
-az group create --name $RG --location $LOCATION
-
-az appservice plan create --name $PLAN --resource-group $RG --sku B1 --is-linux
-
-az webapp create --name app-taskflow-api-01 --resource-group $RG --plan $PLAN --runtime "NODE:20-lts"
-az webapp create --name app-taskflow-api-02 --resource-group $RG --plan $PLAN --runtime "NODE:20-lts"
 ```
 
-### Deploy
+On Windows PowerShell use this instead:
+
+```powershell
+$RG="rg-taskflow"
+$LOCATION="eastus"
+$PLAN="asp-taskflow"
+```
+
+## 2.4 Create the resource group
+
+**Azure Portal way:**
+1. Go to portal.azure.com
+2. Click **Create a resource**
+3. Search for **Resource group**, click **Create**
+4. Name: `rg-taskflow`
+5. Region: pick one near you
+6. Click **Review + create**, then **Create**
+
+**Command line way:**
+```bash
+az group create --name $RG --location $LOCATION
+```
+
+## 2.5 Create the App Service Plan
+
+This is the computer that will run your apps.
+
+```bash
+az appservice plan create \
+  --name $PLAN \
+  --resource-group $RG \
+  --sku B1 \
+  --is-linux
+```
+
+What the options mean:
+
+- `--sku B1` is the size. B1 means "Basic, size 1". It is small and cheap. **Do not use the free F1 tier**, because it cannot do deployment slots, which you need in Step 3.
+- `--is-linux` makes it a Linux computer. Linux and Windows plans are completely separate in Azure. You cannot mix Linux and Windows apps on one Plan.
+
+## 2.6 Create the two App Services
+
+```bash
+az webapp create \
+  --name app-taskflow-api-01 \
+  --resource-group $RG \
+  --plan $PLAN \
+  --runtime "NODE:20-lts"
+
+az webapp create \
+  --name app-taskflow-api-02 \
+  --resource-group $RG \
+  --plan $PLAN \
+  --runtime "NODE:20-lts"
+```
+
+**Important:** App Service names must be unique across **all of Azure**, not just your account. Somebody else may already have taken `app-taskflow-api-01`. If Azure rejects the name, add something unique to the end, such as `app-taskflow-api-01-ikh`.
+
+If you change the names, remember to use your new names in all the commands that follow.
+
+`--runtime "NODE:20-lts"` tells Azure "this is a Node.js 20 app". Azure then prepares the right environment to run it.
+
+## 2.7 Package your app
+
+Azure needs your code in a zip file.
+
 ```bash
 cd backend
 zip -r ../api.zip . -x "node_modules/*"
-
-az webapp deploy --resource-group $RG --name app-taskflow-api-01 --src-path ../api.zip --type zip
-az webapp deploy --resource-group $RG --name app-taskflow-api-02 --src-path ../api.zip --type zip
 ```
 
-**Why exclude `node_modules`:** `az webapp deploy` hands the zip to **Oryx**, which runs `npm install` server-side. Zipping `node_modules` yourself can make Oryx skip the install, leaving a platform mismatch (native modules built for the wrong OS).
+On Windows, if you do not have `zip`, select the contents of the `backend` folder, right-click, and choose "Send to, Compressed folder". Name it `api.zip`.
 
-### Expected result
+**Why do we exclude `node_modules`?**
+
+`node_modules` is the folder with all your downloaded libraries. It is large, and it is built for **your** computer's operating system. Azure runs Linux. Some libraries are compiled differently on different operating systems.
+
+When you upload a zip without `node_modules`, Azure runs `npm install` itself, on its own Linux machine, and gets the correct versions. This is what you want.
+
+If you include `node_modules`, Azure sometimes thinks "this is already built" and skips the install. Then your app may fail with strange errors.
+
+## 2.8 Deploy to both App Services
+
+```bash
+az webapp deploy \
+  --resource-group $RG \
+  --name app-taskflow-api-01 \
+  --src-path ../api.zip \
+  --type zip
+
+az webapp deploy \
+  --resource-group $RG \
+  --name app-taskflow-api-02 \
+  --src-path ../api.zip \
+  --type zip
+```
+
+Each deploy takes one to three minutes. Azure unzips your code, runs `npm install`, then runs `npm start`.
+
+What happens during a deploy:
+
+```mermaid
+flowchart LR
+    Z["Your zip file"] --> U["Azure unzips it"]
+    U --> I["Azure runs<br/>npm install"]
+    I --> S["Azure runs<br/>npm start"]
+    S --> R["Your app is<br/>live on the internet"]
+```
+
+## 2.9 Expected result
+
+Test both apps:
+
 ```bash
 curl https://app-taskflow-api-01.azurewebsites.net/api/hello
 curl https://app-taskflow-api-02.azurewebsites.net/api/hello
 ```
-Both respond independently, both `version: "1.0.0"`.
 
-### Verification checklist
-- [ ] `az webapp list --resource-group $RG -o table` shows both **Running**
-- [ ] Both `/api/health` return 200
-- [ ] `az webapp log tail` shows a clean start, no crash loop
+Both return the same JSON you saw on your laptop in Step 1, with `"version": "1.0.0"`.
 
-### Common errors
-| Symptom | Cause | Fix |
-|---|---|---|
-| Placeholder page instead of JSON | Zip included `node_modules`, Oryx skipped install | Rezip without `node_modules` |
-| 502 | Hardcoded port instead of `process.env.PORT` | Read `PORT` from env |
-| "Name already taken" | App Service names are globally unique | Add a unique suffix |
-| Old content after deploy | Browser cache | `curl` to confirm real state |
+Your app is now on the public internet.
+
+## 2.10 See the logs
+
+This is the most useful Azure command you will learn. When something breaks, run this first.
+
+```bash
+az webapp log tail --resource-group $RG --name app-taskflow-api-01
+```
+
+This shows you what your app is printing, live. You will see your `API running on port ...` message.
+
+Press Ctrl+C to stop watching.
+
+## 2.11 Change the version using Azure settings
+
+Remember section 1.6? Now you get to use it.
+
+```bash
+az webapp config appsettings set \
+  --resource-group $RG \
+  --name app-taskflow-api-01 \
+  --settings APP_VERSION=2.0.0
+```
+
+Wait about thirty seconds for the app to restart, then test both apps again:
+
+```bash
+curl https://app-taskflow-api-01.azurewebsites.net/api/hello   # version 2.0.0
+curl https://app-taskflow-api-02.azurewebsites.net/api/hello   # version 1.0.0
+```
+
+**Look at what just happened.** Two apps, identical code, running different versions. You changed one without touching the other, and without redeploying anything.
+
+An Azure "Application Setting" is simply an environment variable. It is the exact same mechanism you tested on your laptop in section 1.12.
+
+## 2.12 Start, stop and restart
+
+You can control an App Service without deleting it.
+
+```bash
+# Stop it. It stops responding, but nothing is deleted.
+az webapp stop --resource-group $RG --name app-taskflow-api-02
+
+# Check its state
+az webapp show --resource-group $RG --name app-taskflow-api-02 --query state
+
+# Start it again
+az webapp start --resource-group $RG --name app-taskflow-api-02
+```
+
+In the Portal, these are buttons at the top of the App Service's Overview page.
+
+**Note:** stopping does not save you money on the Basic tier. You are paying for the App Service Plan, which is the computer, and that keeps running whether your apps are stopped or not.
+
+## 2.13 Verification
+
+- [ ] `az webapp list --resource-group $RG -o table` shows both apps as Running
+- [ ] Both `/api/hello` URLs return JSON from the internet
+- [ ] Both `/api/health` URLs return `"status": "Healthy"`
+- [ ] `az webapp log tail` shows your app's startup message
+- [ ] After setting `APP_VERSION` on app 01, the two apps show different versions
+- [ ] You can explain the difference between a Plan and an App Service in your own words
+
+## 2.14 Troubleshooting
+
+| What you see | Why it happens | How to fix it |
+|-------------|---------------|--------------|
+| A blue Azure welcome page instead of your JSON | Your app did not start, so Azure is showing its default page | Run `az webapp log tail` to see the real error |
+| **502 Bad Gateway** | Your app started but Azure cannot reach it. Almost always the port | Check `server.js` uses `process.env.PORT`, not a hardcoded 3000 |
+| Deploy succeeded but nothing changed | Your zip did not contain what you expected | Unzip `api.zip` somewhere and check `server.js` and `package.json` are at the top level, not inside a subfolder |
+| "Website with given name already exists" | App Service names are globally unique | Add your initials to the name and retry |
+| App works, then stops working after a while | The free F1 tier has daily limits | Use B1 or higher |
+
+## 2.15 Interview questions
+
+**Q: What is the difference between an App Service and an App Service Plan?**
+The Plan is the computer: a set of CPU and memory at a chosen size, on Linux or Windows. That is what you pay for. The App Service is an application running on that computer. Many App Services can share one Plan.
+
+**Q: If two App Services share a Plan and one gets a traffic spike, what happens to the other?**
+It can slow down. They share the same CPU and memory. This is why production systems often give important applications their own Plan, so a problem in one app cannot affect another.
+
+**Q: Why does Azure need a `start` script in package.json?**
+Azure does not know which of your files is the entry point. It always runs `npm start`, and `npm start` reads that script line to find out. Without it, the deploy succeeds but the app never runs, which usually appears as a 502 error.
 
 ---
+---
 
-## STEP 3 — Deployment slot: create, stop, restart
+# STEP 3 — Deployment slots
 
-### Objective
-Add a **staging** slot to `app-taskflow-api-01`, deploy a changed version to it only, verify independently of production, then demonstrate **stopping and restarting** the slot as an operational action separate from deploying new code.
+## 3.1 What you are doing
 
-### Architecture
+You will add a second, private copy of App Service 01 called **staging**. You will put a new version there, test it, and then stop and start it.
+
+## 3.2 The problem slots solve
+
+Right now, if you deploy new code, it goes live instantly. If the code is broken, every user sees the broken version straight away. You find out from angry users.
+
+A slot fixes this. A slot is a second copy of your app, inside the same App Service, with **its own separate web address**.
+
+```mermaid
+flowchart TB
+    subgraph APP["App Service: app-taskflow-api-01"]
+        PROD["Production slot<br/>real users are here<br/>version 2.0.0<br/>app-taskflow-api-01.azurewebsites.net"]
+        STG["Staging slot<br/>only you are here<br/>version 3.0.0<br/>app-taskflow-api-01-staging.azurewebsites.net"]
+    end
 ```
-┌────────────────────────────────────────────┐
-│           app-taskflow-api-01                │
-│   ┌────────────────────┐  ┌───────────────┐ │
-│   │   production slot   │  │  staging slot  │ │
-│   │  (default hostname)  │  │ (own hostname) │ │
-│   │   version 1.0.0      │  │ version 2.0.0  │ │
-│   └────────────────────┘  └───────────────┘ │
-└────────────────────────────────────────────┘
-```
 
-**Why a slot instead of deploying directly to production:** a slot gives the new version its own real, testable URL on the same App Service, before anyone else sees it. Only then do you promote it.
+You deploy to staging. You test staging. Real users never see it. Only when you are happy do you promote it.
 
-### Portal steps
-1. `app-taskflow-api-01` → **Deployment slots** → **Add Slot** → name `staging`, don't clone settings.
-2. Open the slot — note its distinct hostname: `app-taskflow-api-01-staging.azurewebsites.net`.
-3. **Stop**: inside the slot → toolbar → **Stop**. **Restart**: same location → **Start**.
+## 3.3 Requirement: you need the Standard tier
 
-### CLI
+Deployment slots do not work on the Basic (B1) tier. Upgrade the Plan:
+
 ```bash
-RG=rg-taskflow
+az appservice plan update \
+  --name $PLAN \
+  --resource-group $RG \
+  --sku S1
+```
 
-az webapp deployment slot create --name app-taskflow-api-01 --resource-group $RG --slot staging
+This costs more per hour. Remember to delete everything at the end of the course.
 
+## 3.4 Create the slot
+
+**Azure Portal way:**
+1. Open `app-taskflow-api-01`
+2. In the left menu, click **Deployment slots**
+3. Click **Add Slot**
+4. Name: `staging`
+5. Clone settings from: **Do not clone settings**
+6. Click **Add**
+
+**Command line way:**
+```bash
+az webapp deployment slot create \
+  --name app-taskflow-api-01 \
+  --resource-group $RG \
+  --slot staging
+```
+
+Your new slot has its own address:
+`https://app-taskflow-api-01-staging.azurewebsites.net`
+
+## 3.5 The most important warning in this step
+
+**Every slot command needs `--slot staging`.**
+
+If you forget it, the command targets **production** instead. This is how people accidentally stop their live website.
+
+```mermaid
+flowchart TB
+    C1["az webapp stop --name app-taskflow-api-01 --slot staging"] --> R1["Staging stops.<br/>Production is fine."]
+    C2["az webapp stop --name app-taskflow-api-01"] --> R2["PRODUCTION stops.<br/>Your live site is down."]
+```
+
+Make it a habit: type `--slot staging` immediately after the app name, before you type anything else.
+
+## 3.6 Deploy a new version to staging only
+
+Change the version in your code so you can tell the two apart. Edit `backend/server.js`:
+
+```js
+const APP_VERSION = process.env.APP_VERSION || '3.0.0';
+```
+
+Rezip and deploy to the slot:
+
+```bash
 cd backend
-# bump: const APP_VERSION = process.env.APP_VERSION || '2.0.0';
-zip -r ../api-v2.zip . -x "node_modules/*"
-az webapp deploy --resource-group $RG --name app-taskflow-api-01 --slot staging --src-path ../api-v2.zip --type zip
+zip -r ../api-v3.zip . -x "node_modules/*"
 
-az webapp stop --name app-taskflow-api-01 --resource-group $RG --slot staging
-az webapp show --name app-taskflow-api-01 --resource-group $RG --slot staging --query state   # "Stopped"
-
-az webapp start --name app-taskflow-api-01 --resource-group $RG --slot staging
-az webapp show --name app-taskflow-api-01 --resource-group $RG --slot staging --query state   # "Running"
+az webapp deploy \
+  --resource-group $RG \
+  --name app-taskflow-api-01 \
+  --slot staging \
+  --src-path ../api-v3.zip \
+  --type zip
 ```
 
-**Why `--slot staging` must be on every command:** omit it and the command silently targets production. This is the most common slot mistake — get in the habit of typing `--slot` immediately after the app name.
+## 3.7 Expected result
 
-### Expected result
+Test both addresses:
+
 ```bash
-curl https://app-taskflow-api-01.azurewebsites.net/api/hello           # version 1.0.0, untouched
-curl https://app-taskflow-api-01-staging.azurewebsites.net/api/hello   # version 2.0.0
+# Production, real users see this
+curl https://app-taskflow-api-01.azurewebsites.net/api/hello
+# version: 2.0.0, unchanged from Step 2.11
+
+# Staging, only you see this
+curl https://app-taskflow-api-01-staging.azurewebsites.net/api/hello
+# version: 3.0.0, your new code
 ```
-After stopping staging, its URL returns 403/"stopped" — not 502. That distinction matters: 502 means the app tried and crashed; 403 means Azure deliberately isn't running it.
 
-### Verification checklist
-- [ ] Production shows `1.0.0`, staging shows `2.0.0`, simultaneously
-- [ ] Stopping staging fails cleanly (403/stopped), production unaffected
-- [ ] Starting staging brings `2.0.0` back
-- [ ] Production's own `state` (no `--slot`) never changed to `Stopped`
+Two versions, running at the same time, inside one App Service. Production users are completely unaffected by your new code.
 
-### Common errors
-| Symptom | Cause | Fix |
-|---|---|---|
-| Production went down after `az webapp stop` | Forgot `--slot staging` | Always type `--slot <name>` right after the app name |
-| Staging shows old version after deploy | Deployed without `--slot`, landed elsewhere | Re-run deploy with the slot flag |
-| Slot creation fails with a pricing error | Slots require Standard (S1)+, not Basic | `az appservice plan update --sku S1` |
-| 502 instead of clean stop | Restarted mid-deploy | Wait for deploy to finish first |
+## 3.8 Stop and start the slot
+
+```bash
+# Stop the staging slot
+az webapp stop --resource-group $RG --name app-taskflow-api-01 --slot staging
+
+# Confirm it is stopped
+az webapp show --resource-group $RG --name app-taskflow-api-01 --slot staging --query state
+# Expected: "Stopped"
+
+# Now test the staging URL. It will fail.
+curl https://app-taskflow-api-01-staging.azurewebsites.net/api/hello
+
+# Now test production. It still works perfectly.
+curl https://app-taskflow-api-01.azurewebsites.net/api/hello
+
+# Start staging again
+az webapp start --resource-group $RG --name app-taskflow-api-01 --slot staging
+```
+
+**Understand the difference between two failure types:**
+
+| Response | Meaning |
+|----------|---------|
+| 403 or a "stopped" page | Azure deliberately is not running it. You stopped it. |
+| 502 Bad Gateway | Azure tried to run it, but the app crashed. |
+
+These look similar but mean opposite things. A 403 after stopping is expected and correct. A 502 means something is actually broken.
+
+## 3.9 Verification
+
+- [ ] Production shows one version and staging shows a different version, at the same time
+- [ ] Stopping staging does not affect production
+- [ ] Starting staging brings it back
+- [ ] You checked production's state and it never said "Stopped"
+- [ ] You can explain when you would use a slot in real work
+
+## 3.10 Troubleshooting
+
+| What you see | Why it happens | How to fix it |
+|-------------|---------------|--------------|
+| "Cannot create slot" error | You are still on the Basic (B1) tier | Upgrade to S1, see section 3.3 |
+| Production went down unexpectedly | You forgot `--slot staging` on a stop command | `az webapp start --resource-group $RG --name app-taskflow-api-01` with no slot flag |
+| Staging shows the old version | The deploy went to production instead | Redeploy, and check you included `--slot staging` |
+
+## 3.11 Interview questions
+
+**Q: Why does a deployment slot need its own web address?**
+So you can test the new version properly while real users continue using the old one. If both shared an address, there would be no way to reach the new version without exposing it to everybody.
+
+**Q: What is the difference between stopping a slot and deleting it?**
+Stopping pauses the running app. The slot, its settings and its deployed code all stay. You can start it again in seconds. Deleting removes the slot completely, including its configuration. Stop when you are pausing temporarily. Delete when you are finished with it.
+
+**Q: What is a slot swap and why would you use it?**
+A swap exchanges the staging slot with production. The version you tested in staging becomes the live version, and the old production version moves into staging. Because the app in staging is already running and warmed up, the switch is nearly instant, and if something goes wrong you can swap back to undo it.
 
 ---
+---
 
-## STEP 4 — Custom path configuration (`/myapp`)
+# STEP 4 — Custom path `/myapp`
 
-### Objective
-Make `app-taskflow-api-02` reachable under a sub-path: `GET /myapp/api/hello`.
+## 4.1 What you are doing
 
-### The platform fact that matters here
-Azure's **"Path mappings" → virtual applications and directories** is an **IIS/Windows-only** mechanism. Your App Service is **Linux + Node** — that Portal blade only exposes storage mounts on Linux, not URL virtual directories. The correct answer for Linux/Node: **the app's own routing handles the path**, not App Service configuration. Same "one hostname, path-routed" idea as Step 1's proxy and later AKS Ingress.
+Right now your API answers at `/api/hello`. You will change App Service 02 so it answers at `/myapp/api/hello` instead.
 
-### Architecture
+## 4.2 An important Azure fact first
+
+If you search the internet for "Azure App Service custom path", you will find articles about **Path mappings** and **virtual directories** in the Azure Portal.
+
+**Those do not work for your app.** Here is why.
+
+Virtual directories are a feature of **IIS**, which is Microsoft's Windows web server. They only exist on **Windows** App Services. Your App Service is **Linux**, because you used `--is-linux` in Step 2.5.
+
+On a Linux App Service, that same Portal screen only lets you attach file storage. There is no URL path mapping option at all.
+
+So what do you do instead? **Your application handles the path itself.** This is not a workaround. For Linux and container apps, this is the normal, correct approach.
+
+Go and look for yourself, so this sticks:
+1. Open `app-taskflow-api-02` in the Portal
+2. Click **Configuration** in the left menu
+3. Click the **Path mappings** tab
+4. Notice there are only storage mount options, no URL paths
+
+## 4.3 How it will work
+
+```mermaid
+flowchart LR
+    subgraph BEFORE["Before"]
+        B1["/api/hello"] --> B2["works"]
+    end
+
+    subgraph AFTER["After"]
+        A1["/myapp/api/hello"] --> A2["works"]
+        A3["/api/hello"] --> A4["404 Not Found"]
+    end
 ```
-┌───────────────────────────────────────────────┐
-│              app-taskflow-api-02                │
-│   Express app                                   │
-│   ┌─────────────────────────────────────────┐  │
-│   │  app.use('/myapp', router)                │  │
-│   │        └── GET /api/hello                 │  │
-│   │        └── GET /api/health                │  │
-│   └─────────────────────────────────────────┘  │
-│   Result: GET /myapp/api/hello  → 200            │
-│           GET /api/hello        → 404            │
-└───────────────────────────────────────────────┘
-```
 
-### Updated code
+## 4.4 Change the code
 
-`backend/server.js`:
+Open `backend/server.js`. You are going to make one structural change.
+
+Instead of attaching endpoints directly to `app`, you attach them to a **Router**, then mount that whole Router under `/myapp`.
+
 ```js
 const express = require('express');
 const cors = require('cors');
+
 const app = express();
 app.use(cors());
 
 const APP_VERSION = process.env.APP_VERSION || '1.0.0';
+
+// Create a router. Think of it as a group of endpoints.
 const router = express.Router();
 
 router.get('/api/hello', (req, res) => {
-  res.json({ message: 'Hello from Node.js API', version: APP_VERSION, timestamp: new Date().toISOString() });
-});
-router.get('/api/health', (req, res) => {
-  res.json({ status: 'Healthy', version: APP_VERSION });
+  res.json({
+    message: 'Hello from Node.js API',
+    version: APP_VERSION,
+    timestamp: new Date().toISOString()
+  });
 });
 
+router.get('/api/health', (req, res) => {
+  res.json({
+    status: 'Healthy',
+    version: APP_VERSION
+  });
+});
+
+// THIS is the line that adds /myapp in front of every route above.
 app.use('/myapp', router);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log('API running on port ' + PORT);
+});
 ```
 
-**What changed:** `router.get(...)` is unchanged from Step 1/2; `app.use('/myapp', router)` is the one line that prefixes every route. The path is a mounting decision, not a rewrite of the handlers.
+## 4.5 Why write it this way
 
-### Deploy
+Notice the endpoint definitions did not change. They still say `/api/hello`. Only one new line was added:
+
+```js
+app.use('/myapp', router);
+```
+
+That one line puts `/myapp` in front of every route in the group.
+
+**Compare this with the bad way**, where someone writes the prefix into every single route:
+
+```js
+// DO NOT DO THIS
+app.get('/myapp/api/hello', ...);
+app.get('/myapp/api/health', ...);
+```
+
+Both work today. But imagine six months from now your boss says "change `/myapp` to `/taskflow`".
+
+- Good way: change one line.
+- Bad way: find and change every route, and hope you did not miss one.
+
+This is a small example of a big principle: put a setting in one place, not scattered through your code.
+
+## 4.6 Deploy to App Service 02 only
+
 ```bash
 cd backend
 zip -r ../api-myapp.zip . -x "node_modules/*"
-az webapp deploy --resource-group rg-taskflow --name app-taskflow-api-02 --src-path ../api-myapp.zip --type zip
+
+az webapp deploy \
+  --resource-group $RG \
+  --name app-taskflow-api-02 \
+  --src-path ../api-myapp.zip \
+  --type zip
 ```
 
-### Portal steps
-1. `app-taskflow-api-02` → **Configuration** → **Path mappings** — open it once, confirm only storage mounts appear (proof of the Linux limitation above).
-2. **Advanced Tools (Kudu)** → **Debug console** — useful for `curl localhost/myapp/api/hello` from *inside* the container to rule out "is it the app or the networking in front of it."
+## 4.7 Expected result
 
-### Expected result
 ```bash
-curl https://app-taskflow-api-02.azurewebsites.net/myapp/api/hello   # 200
-curl https://app-taskflow-api-02.azurewebsites.net/api/hello         # 404
+# New path, works
+curl https://app-taskflow-api-02.azurewebsites.net/myapp/api/hello
+# Returns your JSON
+
+# Old path, now gone
+curl https://app-taskflow-api-02.azurewebsites.net/api/hello
+# Returns 404 Not Found
+
+# App Service 01, untouched, still on the old path
+curl https://app-taskflow-api-01.azurewebsites.net/api/hello
+# Still returns your JSON
 ```
 
-### Verification checklist
-- [ ] `/myapp/api/hello` → 200 with expected JSON
-- [ ] Bare `/api/hello` → 404 (proves the mount is real)
-- [ ] `app-taskflow-api-01` untouched, still responds at its original paths
+The 404 on the old path is **good news**. It proves the change really took effect and is not a coincidence.
 
-### Common errors
-| Symptom | Cause | Fix |
-|---|---|---|
-| Both paths 404 | Old process still running, deploy didn't restart it | `az webapp log tail` to confirm the new code started |
-| Looking for "virtual directory" and can't find it | You're on Linux | Confirm with `az webapp show --query "kind"`; this is a platform limit, not a UI hunt |
-| Frontend 404s everywhere | `apiUrl` still points at old root paths | Update `environment.prod.ts` to `.../myapp/api`, rebuild, redeploy |
+## 4.8 A useful debugging trick
+
+Azure gives every App Service a hidden tool called **Kudu**. It lets you open a terminal **inside** your running app.
+
+1. Go to `app-taskflow-api-02` in the Portal
+2. Click **Advanced Tools** in the left menu
+3. Click **Go**
+4. Click **Debug console**, then **Bash**
+5. Run: `curl http://localhost:8080/myapp/api/hello`
+
+Why is this useful? If this works inside the container but your public URL does not, you know the app is fine and the problem is in Azure's networking in front of it. That instantly cuts your search in half.
+
+## 4.9 Verification
+
+- [ ] `/myapp/api/hello` returns 200 and your JSON
+- [ ] `/api/hello` on app 02 returns 404
+- [ ] App Service 01 still works on its original paths
+- [ ] You looked at the Path mappings screen and saw there are no URL options on Linux
+
+## 4.10 Troubleshooting
+
+| What you see | Why it happens | How to fix it |
+|-------------|---------------|--------------|
+| Both paths return 404 | The new code did not start | `az webapp log tail` to check. Restart the app if needed |
+| Cannot find "virtual directory" in the Portal | You are on Linux, that feature is Windows only | See section 4.2. Use application routing instead |
+| Your Angular frontend broke | It still calls the old path | Update the URL in the Angular code, rebuild, redeploy |
+
+## 4.11 Interview questions
+
+**Q: Why can you not use Azure's virtual directory feature on a Linux App Service?**
+Virtual directories are provided by IIS, which is the Windows web server. Linux App Services do not run IIS, so the feature does not exist there. On Linux you handle URL paths inside the application itself, or with a reverse proxy in front of it.
+
+**Q: You need two different applications on one address, one at `/app1` and one at `/app2`. How would you do it?**
+Put a routing layer in front of both. In Azure that would be Application Gateway or Azure Front Door with path-based rules. In Kubernetes it would be an Ingress controller. The routing decision belongs to the layer in front, because neither application can route to the other.
+
+**Q: Why use `app.use('/myapp', router)` instead of writing the prefix into each route?**
+It keeps the path in one place. Changing it later is a one-line edit instead of a risky search-and-replace across the whole codebase.
 
 ---
+---
 
-## STEP 5 — Dockerize the application
+# STEP 5 — Docker
 
-### Objective
-Containerize both apps — same source, no logic changes — and prove both images work locally before touching Azure.
+## 5.1 What you are doing
 
-### Architecture
+You will package your app into a **container image**, then run it on your laptop as a container.
+
+## 5.2 What Docker actually solves
+
+You know the phrase "it works on my machine". Docker exists to end that sentence.
+
+Your app needs Node.js version 20. It needs Express and cors. It needs certain files in certain places. If the server has Node 18 instead of 20, your app may break in strange ways.
+
+A **container image** is a package containing your app **and** everything it needs to run: the Node.js runtime, the libraries, the files, the startup command. Everything.
+
+Anywhere that image runs, it runs identically. Your laptop, Azure, a colleague's Mac, all the same.
+
+## 5.3 Image vs container
+
+People confuse these two words constantly. Here is the difference.
+
+```mermaid
+flowchart LR
+    IMG["IMAGE<br/>the recipe<br/><br/>a file on disk<br/>does nothing on its own<br/>built once<br/>can be copied and shared"]
+    C1["CONTAINER 1<br/>running program"]
+    C2["CONTAINER 2<br/>running program"]
+    C3["CONTAINER 3<br/>running program"]
+
+    IMG -->|"docker run"| C1
+    IMG -->|"docker run"| C2
+    IMG -->|"docker run"| C3
 ```
-┌───────────────────────────┐        ┌───────────────────────────┐
-│   taskflow-api image       │        │   taskflow-web image        │
-│  (Node 20 alpine, 2-stage)  │        │  (nginx alpine, 2-stage)     │
-│  Stage 1: npm ci + copy      │        │  Stage 1: npm ci + ng build  │
-│  Stage 2: runtime only        │        │  Stage 2: nginx serves dist  │
-│  CMD node server.js           │        │  EXPOSE 80                   │
-│  EXPOSE 3000                  │        │                             │
-└───────────────────────────┘        └───────────────────────────┘
-```
 
-**Why multi-stage:** the build stage needs `devDependencies` and the Angular CLI; none of that belongs in the running image. Multi-stage copies out only the finished artifact.
+An image is like a class in programming. A container is like an object created from that class. One image can produce many containers at the same time.
 
-### Dockerfiles
+## 5.4 The Dockerfile
 
-`backend/Dockerfile`:
+A Dockerfile is a recipe. It lists the steps to build your image.
+
+Create `backend/Dockerfile`:
+
 ```dockerfile
+# ---- Stage 1: build ----
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY . .
 
+# ---- Stage 2: the final image ----
 FROM node:20-alpine
 WORKDIR /app
 COPY --from=build /app ./
@@ -397,8 +1003,56 @@ EXPOSE 3000
 CMD ["node", "server.js"]
 ```
 
-`frontend/Dockerfile`:
+Line by line:
+
+| Line | What it does |
+|------|-------------|
+| `FROM node:20-alpine` | Start from a ready-made image that already has Node.js 20. "alpine" means a very small Linux |
+| `WORKDIR /app` | Work inside the `/app` folder from now on |
+| `COPY package*.json ./` | Copy only the package files first |
+| `RUN npm ci --omit=dev` | Install the libraries |
+| `COPY . .` | Now copy the rest of your code |
+| `EXPOSE 3000` | Document that this app listens on port 3000 |
+| `CMD ["node", "server.js"]` | The command to run when the container starts |
+
+## 5.5 Why copy package.json before the rest of the code
+
+This looks strange, but there is a good reason.
+
+Docker saves each step as a **layer**, and reuses layers that have not changed. Installing libraries is slow. Copying your code is fast.
+
+If you copied everything at once, then every time you change one line of `server.js`, Docker would reinstall every library from scratch.
+
+By copying `package.json` first, Docker only reinstalls libraries when `package.json` itself changes. Editing `server.js` reuses the cached install step and builds in seconds instead of minutes.
+
+## 5.6 Why two stages
+
+Notice the Dockerfile says `FROM` twice. This is called a **multi-stage build**.
+
+```mermaid
+flowchart LR
+    subgraph S1["Stage 1: build"]
+        B1["Node.js<br/>+ all libraries<br/>+ build tools<br/>+ your source code"]
+    end
+
+    subgraph S2["Stage 2: final image"]
+        B2["only the<br/>finished result"]
+    end
+
+    B1 -->|"copy just what is needed"| B2
+    B1 -.->|"everything else<br/>is thrown away"| X["discarded"]
+```
+
+Why bother? Because the build stage may need tools that the final running app does not need. Leaving them in makes your image bigger, slower to upload, slower to download, and gives attackers more to work with.
+
+For the frontend this matters a lot. Building Angular needs the whole Angular toolchain, hundreds of megabytes. But running the finished website needs none of it, just the static files and a small web server.
+
+## 5.7 Frontend Dockerfile
+
+Create `frontend/Dockerfile`:
+
 ```dockerfile
+# ---- Stage 1: build the Angular app ----
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package*.json ./
@@ -406,13 +1060,22 @@ RUN npm ci
 COPY . .
 RUN npx ng build --configuration production
 
+# ---- Stage 2: serve the finished files with nginx ----
 FROM nginx:alpine
 COPY --from=build /app/dist/frontend/browser /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
 ```
 
-`frontend/nginx.conf` (SPA fallback — without it, refreshing on any non-root route 404s):
+Stage 1 uses Node to build Angular into plain HTML, CSS and JavaScript files.
+Stage 2 throws away Node entirely and uses **nginx**, a small fast web server, to serve those files.
+
+The final image contains no Node.js and no Angular tooling at all. Just nginx and your built files.
+
+## 5.8 The nginx config and why you need it
+
+Create `frontend/nginx.conf`:
+
 ```nginx
 server {
   listen 80;
@@ -423,201 +1086,316 @@ server {
 }
 ```
 
-`environment.prod.ts` — point at wherever the API is reachable from (finalized in Step 7):
-```ts
-export const environment = {
-  production: true,
-  apiUrl: '/myapp/api'
-};
-```
+The important line is `try_files $uri $uri/ /index.html;`.
 
-### Build, run, verify
+Here is the problem it solves. Angular is a single-page application. When you click a link inside the app, Angular changes the URL in the browser without asking the server for anything.
+
+But if the user presses **F5** to refresh on that URL, the browser now asks nginx for that exact path. nginx looks for a file with that name, does not find one, and returns 404.
+
+`try_files` tells nginx: "if you cannot find a matching file, send `index.html` instead". Angular then loads and works out the correct page from the URL.
+
+Without this line, your app works until somebody refreshes the page.
+
+## 5.9 Build the images
+
 ```bash
 docker build -t taskflow-api:v1 ./backend
 docker build -t taskflow-web:v1 ./frontend
+```
 
-docker run -d --name api-test -p 3000:3000 -e APP_VERSION=1.0.0 taskflow-api:v1
-docker ps
+`-t taskflow-api:v1` gives the image a name and a tag. The name is `taskflow-api`. The tag is `v1`, which is the version.
+
+Check what you built:
+
+```bash
+docker images
+```
+
+## 5.10 Run a container
+
+```bash
+docker run -d --name api-test -p 3000:3000 -e APP_VERSION=5.0.0 taskflow-api:v1
+```
+
+Every option explained:
+
+| Option | Meaning |
+|--------|---------|
+| `-d` | Run in the background, so you get your terminal back |
+| `--name api-test` | Give the container a name you can remember, instead of a random ID |
+| `-p 3000:3000` | Connect port 3000 on your laptop to port 3000 inside the container |
+| `-e APP_VERSION=5.0.0` | Set an environment variable inside the container |
+
+**Look at that `-e` option.** It is the same idea as Step 1.12 and Step 2.11. Third platform, same concept.
+
+Port mapping explained:
+
+```mermaid
+flowchart LR
+    L["Your laptop<br/>localhost:3000"] <-->|"the -p 3000:3000 flag<br/>connects these two"| C["Inside the container<br/>port 3000<br/>your Node app"]
+```
+
+The left number is your laptop. The right number is inside the container. They do not have to be the same.
+
+## 5.11 Test it
+
+```bash
 curl http://localhost:3000/myapp/api/hello
+```
+
+You should get JSON with `"version": "5.0.0"`.
+
+## 5.12 Useful Docker commands
+
+```bash
+# See running containers
+docker ps
+
+# See the container's output
 docker logs api-test
 
-docker run -d --name web-test -p 8080:80 taskflow-web:v1
-curl -I http://localhost:8080
+# Open a shell inside the container
+docker exec -it api-test sh
 
+# Stop it
+docker stop api-test
+
+# Start it again
+docker start api-test
+
+# Remove it. It must be stopped first.
+docker rm api-test
+```
+
+`docker logs` is your `az webapp log tail` for Docker. When a container will not work, run this first.
+
+## 5.13 Run the frontend too
+
+```bash
+docker run -d --name web-test -p 8080:80 taskflow-web:v1
+```
+
+Open `http://localhost:8080` in your browser.
+
+Note the port mapping is `8080:80`. Inside the container nginx listens on port 80. On your laptop you reach it at port 8080.
+
+## 5.14 Clean up
+
+```bash
 docker stop api-test web-test
 docker rm api-test web-test
 ```
 
-**Flags that recur constantly from here on:** `-d` detached; `--name` a handle instead of a hash; `-p hostPort:containerPort`; `-e` passes an env var into the container — same mechanism as App Service Application Settings, different platform.
+## 5.15 Verification
 
-### Expected result
-- `docker images` shows `taskflow-api:v1` well under 200MB
-- `curl` returns the same JSON seen since Step 1
-- `docker logs` shows a clean startup, no restart loop
+- [ ] `docker build` succeeded for both images
+- [ ] `docker images` shows both, and `taskflow-api` is under about 200 MB
+- [ ] `docker run` plus `curl` returns your JSON
+- [ ] The `-e APP_VERSION` value appears in the response
+- [ ] `docker logs` shows your startup message
+- [ ] The frontend container serves a page at `localhost:8080`
+- [ ] You can explain the difference between an image and a container
 
-### Verification checklist
-- [ ] Both images build without errors
-- [ ] API container: `docker run` + `curl` succeeds at the same endpoint path as Step 4
-- [ ] Frontend container: `curl -I` succeeds
-- [ ] Images are lean — multi-stage actually worked
-- [ ] `docker stop`/`docker logs` behave as expected
+## 5.16 Troubleshooting
 
-### Common errors
-| Symptom | Cause | Fix |
-|---|---|---|
-| `npm ci` fails: "no package-lock.json" | `npm ci` requires a committed lockfile | `npm install` once locally, commit the lockfile, rebuild |
-| Container exits immediately | Node crashed on startup | `docker logs <name>` — usually a missing env var |
-| Frontend 404s on refresh at non-root routes | Missing SPA fallback | Add `try_files $uri $uri/ /index.html;` |
-| Image 400MB+ | `node_modules`/Angular CLI leaked into final stage | Confirm the final stage only `COPY --from=build` of the output folder |
-| Connection refused on curl | Port not published, or container not running | `docker ps` to confirm |
+| What you see | Why it happens | How to fix it |
+|-------------|---------------|--------------|
+| `npm ci` fails: "lock file not found" | `npm ci` requires `package-lock.json` | Run `npm install` once in that folder, then rebuild |
+| Container exits immediately | The app crashed on startup | `docker logs api-test` shows the real error |
+| `curl` says connection refused | Container is not running, or the port mapping is wrong | `docker ps` to check both |
+| Image is 400 MB or more | Build tools got into the final stage | Check stage 2 only copies the built output |
+| Angular page 404s after refresh | Missing `try_files` line in nginx.conf | Add it, see section 5.8 |
+| "Cannot connect to the Docker daemon" | Docker Desktop is not running | Start Docker Desktop and wait for it to be ready |
+
+## 5.17 Interview questions
+
+**Q: What is the difference between an image and a container?**
+An image is a file on disk, a packaged template that does nothing by itself. A container is a running instance created from that image. One image can produce many containers running at the same time.
+
+**Q: Why use a multi-stage Dockerfile?**
+Because the tools needed to build an app are not needed to run it. Building Angular needs the full toolchain, hundreds of megabytes. Running the result needs only static files and a small web server. Multi-stage lets you copy just the finished output into a clean final image, keeping it small and reducing what an attacker could use.
+
+**Q: What is the difference between `npm ci` and `npm install`?**
+`npm install` can update the lock file and tolerate small differences. `npm ci` installs exactly what the lock file says and fails if anything does not match. Docker builds should be identical every time, so `npm ci` is the right choice there.
+
+**Q: Why copy package.json before the application code?**
+For layer caching. Docker reuses unchanged layers. Copying package files first means library installation is only redone when dependencies actually change, not every time you edit a source file.
 
 ---
+---
 
-## STEP 6 — Push images to Azure Container Registry (ACR)
+# STEP 6 — Azure Container Registry
 
-### Objective
-Create a private ACR and push both images — making them reachable from any Azure compute, not just your laptop's Docker daemon.
+## 6.1 What you are doing
 
-### Architecture
+Your images currently exist only on your laptop. You will upload them to **Azure Container Registry**, usually shortened to ACR, which is a private storage service for container images.
+
+## 6.2 Why you need a registry
+
+```mermaid
+flowchart TB
+    L["Your laptop<br/>taskflow-api:v1"]
+    ACR["Azure Container Registry<br/>taskflow-api:v1"]
+    AKS["AKS, App Service,<br/>or any Azure service"]
+
+    L -->|"docker push"| ACR
+    ACR -->|"pull"| AKS
 ```
-┌─────────────────────┐        docker push        ┌───────────────────────────────┐
-│  Your laptop          │ ─────────────────────────▶ │   acrtaskflow.azurecr.io        │
-│  Docker daemon         │                             │   taskflow-api  : v1             │
-│  taskflow-api:v1       │                             │   taskflow-web  : v1             │
-│  taskflow-web:v1       │                             │                                 │
-└─────────────────────┘                             └───────────────────────────────┘
-                                                                    │
-                                                        pulled later by AKS (Step 7)
-```
 
-**Why ACR over Docker Hub:** ACR integrates with AKS via managed identity (`--attach-acr` in Step 7) — AKS nodes authenticate to pull images without you ever handling a registry password inside the cluster. Docker Hub's free-tier pull limits also tend to bite mid-deploy or mid-demo.
+AKS in Step 7 needs to download your image. It cannot reach your laptop. A registry is the shared place both sides can use.
 
-### Portal steps
-1. **Create a resource** → **Container Registry** → name `acrtaskflow<yourinitials>` (globally unique, alphanumeric only).
-2. SKU: **Basic**.
-3. **Access keys** — leave **Admin user disabled**; authenticate via `az acr login` (your own Azure AD identity) instead.
+## 6.3 Why ACR and not Docker Hub
 
-### CLI
+Docker Hub is the well-known public registry. ACR is Azure's private one. For this course ACR is better for two reasons:
+
+1. **It is private.** Your images are not public.
+2. **It connects to AKS without passwords.** In Step 7, one command gives your Kubernetes cluster permission to pull images. No password is stored anywhere. With Docker Hub you would have to create and manage a secret inside the cluster.
+
+## 6.4 Create the registry
+
+**Portal way:**
+1. Open `rg-taskflow`
+2. Click **Create**, then search for **Container Registry**
+3. Registry name: `acrtaskflowikh`, or choose your own, see the note below
+4. SKU: **Basic**
+5. **Review + create**
+
+**Command line way:**
 ```bash
-RG=rg-taskflow
-ACR=acrtaskflowlearn   # must be globally unique
+ACR=acrtaskflowikh
 
-az acr create --resource-group $RG --name $ACR --sku Basic
+az acr create \
+  --resource-group $RG \
+  --name $ACR \
+  --sku Basic
+```
+
+**Naming rules:** the registry name must be globally unique across all of Azure, and it can only contain lowercase letters and numbers. No hyphens, no underscores, no capitals. If your name is taken, add more characters.
+
+## 6.5 Log in to the registry
+
+```bash
 az acr login --name $ACR
+```
 
+This gives Docker on your laptop permission to upload to your registry.
+
+It does this using your existing `az login` session, and the permission it creates expires after a few hours. You never type or store a registry password. This matters because a password would be a long-lived secret that could leak. A short-lived token tied to your real identity is safer, and Azure's logs can show exactly who pushed what.
+
+For this reason, leave **Admin user** switched **off** in the Portal. You do not need it.
+
+## 6.6 Tag your images
+
+Before you can upload an image, its name must include the registry address.
+
+```bash
 docker tag taskflow-api:v1 $ACR.azurecr.io/taskflow-api:v1
 docker tag taskflow-web:v1 $ACR.azurecr.io/taskflow-web:v1
-
-docker push $ACR.azurecr.io/taskflow-api:v1
-docker push $ACR.azurecr.io/taskflow-web:v1
-
-az acr repository list --name $ACR --output table
-az acr repository show-tags --name $ACR --repository taskflow-api --output table
 ```
 
-**Why `az acr login`, not a stored password:** it fetches a short-lived token tied to your Azure AD identity and hands it to Docker — nothing static is stored. **Why tag and push are separate:** an image name encodes *where it's stored*; `docker tag` points a second name (no rebuild, no duplicate layers) at the ACR hostname, and `push` reads that prefix to know where to send it.
+**Why is tagging a separate command?**
 
-### Expected result
+A Docker image name includes where it belongs. The name `taskflow-api:v1` has no registry in it, so Docker assumes Docker Hub.
+
+`docker tag` adds a second name pointing at the exact same image. Nothing is copied or rebuilt, and no extra disk space is used. It is like adding a second label to the same box.
+
+```mermaid
+flowchart LR
+    N1["Name 1<br/>taskflow-api:v1"] --> IMG["The actual<br/>image data<br/>stored once"]
+    N2["Name 2<br/>acrtaskflowikh.azurecr.io/taskflow-api:v1"] --> IMG
+```
+
+When you push, Docker reads the registry address from the name and knows where to send it.
+
+## 6.7 Push the images
+
+```bash
+docker push $ACR.azurecr.io/taskflow-api:v1
+docker push $ACR.azurecr.io/taskflow-web:v1
+```
+
+This uploads them. It may take a few minutes the first time.
+
+## 6.8 Verify the images really arrived
+
+Do not trust "push succeeded" on your own screen. Ask Azure what it actually has:
+
+```bash
+az acr repository list --name $ACR --output table
+```
+
+Expected:
+
 ```
 Result
 --------------
 taskflow-api
 taskflow-web
 ```
-with `v1` showing under `show-tags` for each — proof the images exist in Azure, not just that `push` printed success locally.
 
-### Verification checklist
-- [ ] `az acr repository list` shows both repositories
-- [ ] `show-tags` confirms `v1`
-- [ ] `docker pull` after removing your local copy succeeds — genuinely retrievable, not cached
-- [ ] Admin user stayed disabled
+```bash
+az acr repository show-tags --name $ACR --repository taskflow-api --output table
+```
 
-### Common errors
-| Symptom | Cause | Fix |
-|---|---|---|
-| `denied: requested access` on push | Login session expired, or wrong registry in the tag | Re-run `az acr login`; check `docker images` for the exact `$ACR.azurecr.io/...` tag |
-| Name rejected during create | Must be globally unique, lowercase alphanumeric only | Try a longer, more specific name |
-| Push hangs/times out | Large image, or Basic SKU throughput limits | Confirm image is lean (Step 5); retry |
-| `docker pull` auth error after successful login | Logged into the wrong subscription/tenant | `az account show`; `az account set --subscription <id>` |
+Expected:
 
----
+```
+Result
+--------
+v1
+```
 
-## Interview Q&A — all steps, with answers, scenarios, and real problems faced
+## 6.9 Prove it is really downloadable
 
-### Step 1 — the application layer
+This is a stronger test. Delete your local copy, then download it back from Azure:
 
-**Q1. Why does the Angular dev server need a proxy config to reach the Node API, and what breaks without it?**
-The browser enforces Same-Origin Policy — `:4200` and `:3000` are different origins. A direct call triggers a CORS preflight, and without `cors()` on the API the browser blocks the response. The proxy makes `/api/*` look same-origin *in development only* — it has no effect on the production bundle.
+```bash
+docker rmi $ACR.azurecr.io/taskflow-api:v1
+docker pull $ACR.azurecr.io/taskflow-api:v1
+```
 
-**Q2. What's the practical difference between `ng serve` and `ng build`?**
-`ng serve` compiles in memory for live reload and is never deployed. `ng build --configuration production` writes real static files to `dist/` — what actually gets hosted anywhere.
+If the pull works, your image genuinely lives in Azure and is not just cached on your machine.
 
-**Q3. Why read `APP_VERSION` from an env var before any Azure resource exists to set one?**
-Adding config flexibility now, with one code path, is far cheaper than retrofitting it after the app is deployed three different ways.
+## 6.10 Verification
 
-### Step 2 — App Service
+- [ ] `az acr repository list` shows both images
+- [ ] `az acr repository show-tags` shows `v1`
+- [ ] You deleted the local image and pulled it back successfully
+- [ ] Admin user is still disabled in the Portal
+- [ ] You can explain why tagging and pushing are two separate steps
 
-**Q4. What's the actual difference between an App Service Plan and an App Service?**
-The Plan is billed compute (VM size/tier/OS); the App Service is a logical app slot running on it. Scaling the Plan scales every App Service on it together — you can't scale one independently on a shared Plan.
+## 6.11 Troubleshooting
 
-**Q5. If two App Services share a Plan and one gets hit with heavy traffic, does the other suffer?**
-Yes — they share CPU/memory/instance count. A real production setup separates unrelated apps onto different Plans specifically to avoid this shared blast radius.
+| What you see | Why it happens | How to fix it |
+|-------------|---------------|--------------|
+| "denied: requested access to the resource is denied" | Your login expired, or the tag has the wrong registry name | Run `az acr login --name $ACR` again. Check `docker images` shows the right full name |
+| Registry name rejected | Names must be globally unique, lowercase letters and numbers only | Try a longer, more unique name |
+| Push is extremely slow | Your image is large, or your upload speed is limited | Check the image size. A good multi-stage build should be small |
+| "unauthorized" even after logging in | You are logged into the wrong Azure subscription | `az account show` to check. `az account set --subscription <id>` to change |
 
-**Q6. Why does zip deploy need a `start` script rather than running a file directly?**
-Oryx's run contract for Node apps is generic — it only knows to invoke `npm start` after `npm install`. A missing/wrong `start` script builds fine but never launches the server, usually surfacing as a 502 with nothing wrong in your own code.
+## 6.12 Interview questions
 
-### Step 3 — deployment slots
+**Q: Why is `az acr login` safer than using an admin username and password?**
+It issues a short-lived token tied to your own Azure identity. Nothing long-lived is stored, the token expires on its own, and Azure's audit logs show which person performed each push or pull. An admin password is a single permanent secret shared by everyone, and if it leaks, anyone can use it with no way to tell who.
 
-**Q7. Why does a slot need its own hostname, and what would you lose without it?**
-It gives the new version a genuinely separate, testable endpoint on the same App Service. Without a distinct hostname you couldn't verify staging without it competing with or replacing production traffic.
+**Q: Why are `docker tag` and `docker push` separate commands?**
+Because an image's name includes where it is stored. Tagging adds a name containing the registry address, without copying or rebuilding anything. Pushing then reads that address and uploads the data there.
 
-**Q8. What's the difference between stopping a slot and deleting it?**
-Stopping pauses the running process while keeping the slot's configuration and deployment history intact — useful when pausing testing temporarily. Deleting removes the slot entirely, including its settings; use it only when that slot's purpose is genuinely done.
-
-**Q9 — Scenario.** *You just stopped production during a live demo by mistake. Walk through recovery and prevention.*
-Recovery: `az webapp start --name <app> --resource-group <rg>` (no `--slot`, targeting production directly), then confirm with `az webapp show --query state`. Prevention: make `--slot <name>` (or its deliberate absence) the very next thing you type after the app name, every time — treat it as part of the command's required syntax, not an optional flag you might forget.
-
-**Problem faced:** a connection string was marked "deployment slot setting" on production by mistake. After a swap, the slot that became production kept the *old* slot's connection string instead of inheriting the intended one — because slot-specific settings deliberately don't swap with the slot; they stay pinned to whichever slot they were set on. Fix: audit which settings are marked slot-specific before any swap, and only mark settings slot-specific when that's genuinely the intent (e.g., a staging-only test database).
-
-### Step 4 — custom path config
-
-**Q10. Why doesn't "virtual applications and directories" apply to a Linux App Service, and what do you do instead?**
-That feature is implemented by IIS, which only runs on Windows App Service. On Linux, the app's own router (Express, in this case) owns URL path structure.
-
-**Q11 — Scenario.** *You need two different apps under one hostname at `/app1` and `/app2`, and platform-level path mapping isn't available. What are your options?*
-Put something in front of both apps that does path-based routing: an Application Gateway or Azure Front Door with path rules, or an nginx/reverse-proxy layer, each forwarding `/app1/*` and `/app2/*` to the respective backend. This is the same pattern AKS Ingress uses later — routing decisions belong to whatever sits in front of the apps, not inside each app individually, once there's more than one app to coordinate.
-
-**Q12 — Scenario.** *A teammate hardcodes `/myapp` into every route string instead of `app.use('/myapp', router)`. Six months later the path needs to change to `/taskflow`. What's the cost difference?*
-With `app.use('/myapp', router)`, the change is one line. With hardcoded strings scattered across every route, it's a find-and-replace across the codebase with real risk of missing one — and worse, any code that constructs URLs by concatenating the path elsewhere now has two sources of truth to update in lockstep.
-
-**Problem faced:** after adding the `/myapp` prefix, the Angular frontend kept 404ing because `environment.prod.ts` still pointed at the old root path — a reminder that a backend routing change is invisible to the frontend until its own config is updated and rebuilt.
-
-### Step 5 — Docker
-
-**Q13. Why doesn't the final Docker stage need the Angular CLI or full `node_modules`?**
-The Angular CLI and dev dependencies only do work at *build* time (compiling TypeScript, bundling, minifying). The final stage only needs to *serve* the already-compiled output — nginx serving static files, or Node running already-transpiled JS — so none of the build tooling belongs in what actually ships.
-
-**Q14. What's the difference between `npm ci` and `npm install`, and why does a Dockerfile want `npm ci`?**
-`npm ci` installs exactly what's in `package-lock.json`, deletes `node_modules` first if present, and fails outright if the lockfile is missing or inconsistent with `package.json`. `npm install` can update the lockfile and tolerate drift. In a Dockerfile you want byte-for-byte reproducible builds — `npm ci` is what guarantees that.
-
-**Q15 — Scenario.** *A teammate's image is 3x larger than yours for the same app. What do you check first?*
-First, whether their final stage does `COPY --from=build` of just the build output, or accidentally copies the whole `/app` directory (dragging `node_modules` and dev tooling along). Second, layer order — Dockerfiles cache layer-by-layer, and putting `COPY . .` before `RUN npm ci` invalidates the dependency-install cache on every single source change, which doesn't bloat the image directly but does bloat build time and encourages sloppy iteration that leads to bloat elsewhere.
-
-**Problem faced:** the frontend image worked at `/` but 404'd on every direct refresh at another route — classic missing SPA fallback in `nginx.conf`. The browser's client-side router handles in-app navigation fine, but a hard refresh asks nginx directly for a path nginx doesn't have a file for; `try_files ... /index.html` is what redirects that request back into the Angular app instead of nginx returning its own 404.
-
-### Step 6 — ACR
-
-**Q16. Why does `az acr login` avoid a static admin password, and why leave Admin user disabled?**
-`az acr login` issues a short-lived token tied to your actual Azure AD identity — nothing long-lived to leak, and every pull/push is attributable to a real identity in audit logs. A shared admin password, by contrast, is a single static secret that, if leaked, grants full registry access with no way to tell which person or system used it.
-
-**Q17. Why are `docker tag` and `docker push` two separate commands?**
-An image name encodes where it lives, not just what it's called. `docker tag` creates a second reference to the same image layers (no rebuild, no disk duplication) with the registry hostname baked in; `push` reads that prefix to know where to actually send the data.
-
-**Q18 — Scenario.** *Someone asks "why ACR instead of Docker Hub for this project?" specific to what happens next.*
-Because Step 7 attaches ACR to AKS via `--attach-acr`, which grants the AKS cluster's managed identity pull access automatically — no registry secret ever has to be created or rotated inside the cluster. Docker Hub would require manually creating and maintaining a Kubernetes `imagePullSecret` with real credentials, which is exactly the kind of static secret ACR's approach avoids.
-
-**Problem faced:** `docker push` succeeded from a personal laptop but failed with a 401 from a CI agent running the same commands. Root cause: `az acr login` on the laptop was riding an interactive Azure AD session; the CI agent had no such session and needed its own non-interactive identity (a service principal or, better, workload identity federation) to authenticate — a reminder that "works on my machine" for ACR auth often means "works under *my* identity," which doesn't automatically transfer to an automated context.
+**Q: Why choose ACR over Docker Hub for a project running on AKS?**
+ACR integrates with AKS directly. One command grants the cluster permission to pull images using its own managed identity, so no registry password ever has to exist inside the cluster. With Docker Hub you would create a Kubernetes secret containing real credentials, which then has to be stored, protected and rotated.
 
 ---
+---
 
-Say **CONTINUE** for Step 7 — deploying this same image to AKS.
+# You have finished Steps 1 to 6
+
+What you have now:
+
+- A working Angular + Node.js app
+- Two App Services running it, on different versions
+- A deployment slot for safe testing
+- One App Service serving from a custom path
+- Two Docker images
+- Both images stored in Azure Container Registry
+
+**Next:** open `TaskFlow_Steps-07-11.md` to deploy these images to Kubernetes.
