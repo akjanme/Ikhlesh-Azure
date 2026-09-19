@@ -1,0 +1,32 @@
+<section class="weather-list" aria-labelledby="weather-title">
+  <div class="heading">
+    <div>
+      <p class="eyebrow">Live conditions</p>
+      <h1 id="weather-title">Weather list</h1>
+    </div>
+    @if (weather().length) {
+      <span class="version">API v{{ weather()[0].version }}</span>
+    }
+  </div>
+
+  @if (loading()) {
+    <p class="status" role="status">Loading weather...</p>
+  } @else if (error()) {
+    <p class="status error" role="alert">{{ error() }}</p>
+  } @else {
+    <ul>
+      @for (item of weather(); track item.city) {
+        <li>
+          <div>
+            <h2>{{ item.city }}</h2>
+            <p>{{ item.condition }}</p>
+          </div>
+          <div class="reading">
+            <strong>{{ item.temperature }}&deg;</strong>
+            <span>Humidity {{ item.humidity }}%</span>
+          </div>
+        </li>
+      }
+    </ul>
+  }
+</section>

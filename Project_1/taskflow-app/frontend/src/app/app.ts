@@ -1,5 +1,5 @@
 import { Component } from '@angular/core';
-import { WeatherListComponent } from './weather-list.component';
+import { WeatherListComponent } from './weather-list/weather-list.component';
 
 @Component({
   selector: 'app-root',
