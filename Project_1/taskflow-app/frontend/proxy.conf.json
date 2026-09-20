@@ -1,6 +1,11 @@
 {
-  "/api": {
+  "/api/weather": {
     "target": "http://localhost:3000",
     "secure": false
+  },
+  "/api/users": {
+    "target": "https://app-taskflow-api-byezcjakd6f5bwf3.westus3-01.azurewebsites.net",
+    "secure": true,
+    "changeOrigin": true
   }
 }
