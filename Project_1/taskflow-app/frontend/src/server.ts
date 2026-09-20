@@ -5,12 +5,66 @@ import {
   writeResponseToNodeResponse,
 } from '@angular/ssr/node';
 import express from 'express';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const browserDistFolder = join(import.meta.dirname, '../browser');
 
 const app = express();
 const angularApp = new AngularNodeAppEngine();
+
+type ProxyConfig = Record<string, { target: string }>;
+
+const proxyConfigPath = join(import.meta.dirname, '../../../proxy.conf.json');
+let proxyConfig: ProxyConfig = {};
+
+try {
+  proxyConfig = JSON.parse(readFileSync(proxyConfigPath, 'utf8')) as ProxyConfig;
+} catch {
+  // Deployment environments can provide API targets through environment variables.
+}
+
+const weatherApiUrl = process.env['TASKFLOW_WEATHER_API_URL'] ||
+  proxyConfig['/api/weather']?.target;
+const usersApiUrl = process.env['TASKFLOW_USERS_API_URL'] ||
+  proxyConfig['/api/users']?.target;
+
+const proxyApiRequest = async (
+  apiUrl: string,
+  path: string,
+  res: express.Response,
+  next: express.NextFunction,
+) => {
+  try {
+    const response = await fetch(`${apiUrl}${path}`);
+    const body = await response.text();
+
+    res
+      .status(response.status)
+      .type(response.headers.get('content-type') || 'application/json')
+      .send(body);
+  } catch (error) {
+    next(error);
+  }
+};
+
+app.get('/api/weather', (_req, res, next) => {
+  if (!weatherApiUrl) {
+    next(new Error('Weather API URL is not configured.'));
+    return;
+  }
+
+  proxyApiRequest(weatherApiUrl, '/api/weather', res, next);
+});
+
+app.get('/api/users', (_req, res, next) => {
+  if (!usersApiUrl) {
+    next(new Error('Users API URL is not configured.'));
+    return;
+  }
+
+  proxyApiRequest(usersApiUrl, '/api/users', res, next);
+});
 
 /**
  * Example Express Rest API endpoints can be defined here.
